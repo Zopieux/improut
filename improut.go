@@ -8,7 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/cespare/xxhash"
-	"github.com/pkg/xattr"
+	xattr "github.com/pkg/xattr"
 	"io"
 	"log"
 	"net/http"
@@ -48,6 +48,7 @@ type options struct {
 
 type storedFile struct {
 	Name          string
+	Expires       *time.Time
 	DeletionToken string
 }
 
@@ -63,12 +64,12 @@ const (
 )
 
 var (
-	listenAddr                = flag.String("listen", ":8000", "listen address (host:port)")
-	maxFileSize               = flag.Int64("max-size", 10<<20, "max file size (bytes)")
-	maxLifetimeDays           = flag.Int("max-lifetime", 0, "0 for infinite retention")
-	lutimeDefaultLitefimeDays = flag.Int("default-lifetime", 7, "Lutim: default lifetime (days, 0 for infinite)")
-	lutimMotd                 = flag.String("motd", "", "Lutim: message of the day")
-	storageRoot               = flag.String("root", "/var/lib/improut", "root storage directory")
+	listenAddr          = flag.String("listen", ":8000", "listen address (host:port)")
+	maxFileSize         = flag.Int64("max-size", 10<<20, "max file size (bytes)")
+	maxLifetimeDays     = flag.Int("max-lifetime", 0, "maximum lifetime (days, 0 for no limit)")
+	defaultLifetimeDays = flag.Int("default-lifetime", 7, "default lifetime (days, 0 for infinite)")
+	lutimMotd           = flag.String("motd", "", "Lutim: message of the day")
+	storageRoot         = flag.String("root", "/var/lib/improut", "root storage directory")
 )
 
 var (
@@ -139,19 +140,23 @@ func storeFile(file io.ReadCloser, originalName string, opts *options) (storedFi
 	if err := xattr.Set(path, kDeletionTokenXAttr, randBytes); err != nil {
 		return storedFile{}, err
 	}
+	var expires *time.Time = nil
 	if opts.LifetimeDays > 0 {
-		expires := time.Now().Add(time.Hour * 24 * time.Duration(opts.LifetimeDays))
-		expiresBin, err := expires.MarshalBinary()
+		t := time.Now().Add(time.Hour * 24 * time.Duration(opts.LifetimeDays))
+		expiresBin, err := t.MarshalBinary()
 		if err != nil {
 			return storedFile{}, err
 		}
 		if err := xattr.Set(path, kExpiresXAttr, expiresBin); err != nil {
 			return storedFile{}, err
 		}
+		expires = &t
+	} else {
+		_ = xattr.Remove(path, kExpiresXAttr)
 	}
 	ok = true
 	log.Printf("Stored file %s (%+v)", path, opts)
-	return storedFile{Name: name, DeletionToken: hex.EncodeToString(randBytes)}, nil
+	return storedFile{Name: name, Expires: expires, DeletionToken: hex.EncodeToString(randBytes)}, nil
 }
 
 func deleteFile(path string, userDeletionToken string) error {
@@ -165,23 +170,28 @@ func deleteFile(path string, userDeletionToken string) error {
 	return err
 }
 
+func parseLifetimeDays(request *http.Request) int {
+	lifetimeDays, err := strconv.Atoi(request.FormValue(kLutimLifetimeArg))
+	if err != nil || lifetimeDays < 1 {
+		lifetimeDays = *defaultLifetimeDays
+	}
+	if *maxLifetimeDays > 0 && lifetimeDays > *maxLifetimeDays {
+		lifetimeDays = *maxLifetimeDays
+	}
+	return lifetimeDays
+}
+
 func lutimUpload(writer http.ResponseWriter, request *http.Request) {
 	if err := request.ParseMultipartForm(*maxFileSize); err != nil {
 		http.Error(writer, err.Error(), http.StatusBadRequest)
 		return
-	}
-	lifetimeDays, err := strconv.Atoi(request.FormValue(kLutimLifetimeArg))
-	if err != nil || lifetimeDays < 1 {
-		lifetimeDays = 0
-	}
-	if *maxLifetimeDays > 0 && lifetimeDays > *maxLifetimeDays {
-		lifetimeDays = *maxLifetimeDays
 	}
 	file, hdr, err := request.FormFile("file")
 	if err != nil {
 		http.Error(writer, err.Error(), http.StatusBadRequest)
 		return
 	}
+	lifetimeDays := parseLifetimeDays(request)
 	stored, err := storeFile(file, hdr.Filename, &options{LifetimeDays: lifetimeDays})
 	if err != nil {
 		http.Error(writer, err.Error(), http.StatusInternalServerError)
@@ -244,12 +254,16 @@ func restUpload(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, err.Error(), http.StatusBadRequest)
 		return
 	}
-	stored, err := storeFile(file, hdr.Filename, &options{LifetimeDays: 0})
+	lifetimeDays := parseLifetimeDays(request)
+	stored, err := storeFile(file, hdr.Filename, &options{LifetimeDays: lifetimeDays})
 	if err != nil {
 		http.Error(writer, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	writer.Header().Set(kDeletionTokenHeader, stored.DeletionToken)
+	if stored.Expires != nil {
+		writer.Header().Set("Expires", stored.Expires.Format(http.TimeFormat))
+	}
 	http.Redirect(writer, request, "/"+stored.Name, 302)
 }
 
@@ -336,8 +350,8 @@ func lutimInfo(writer http.ResponseWriter, request *http.Request) {
 	}{
 		AlwaysEncrypt:    false,
 		BroadcastMessage: *lutimMotd,
-		Contact:          "http://github.com/zopieux/improut/",
-		DefaultDelay:     *lutimeDefaultLitefimeDays,
+		Contact:          kGitUrl,
+		DefaultDelay:     *defaultLifetimeDays,
 		ImageMagick:      false,
 		MaxDelay:         *maxLifetimeDays,
 		MaxFileSize:      *maxFileSize,
