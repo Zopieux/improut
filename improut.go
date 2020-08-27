@@ -64,12 +64,14 @@ const (
 )
 
 var (
-	listenAddr          = flag.String("listen", ":8000", "listen address (host:port)")
-	maxFileSize         = flag.Int64("max-size", 10<<20, "max file size (bytes)")
-	maxLifetimeDays     = flag.Int("max-lifetime", 0, "maximum lifetime (days, 0 for no limit)")
-	defaultLifetimeDays = flag.Int("default-lifetime", 7, "default lifetime (days, 0 for infinite)")
-	lutimMotd           = flag.String("motd", "", "Lutim: message of the day")
-	storageRoot         = flag.String("root", "/var/lib/improut", "root storage directory")
+	listenAddr               = flag.String("listen", ":8000", "listen address (host:port)")
+	maxFileSize              = flag.Int64("max-size", 10<<20, "max file size (bytes)")
+	maxLifetimeDays          = flag.Int("max-lifetime", 0, "maximum lifetime (days, 0 for no limit)")
+	defaultLifetimeDays      = flag.Int("default-lifetime", 7, "default lifetime (days, 0 for infinite)")
+	lutimMotd                = flag.String("motd", "", "Lutim: message of the day")
+	xAccel                   = flag.String("xaccel", "", "if non-empty, use X-Accel-Redirect with this root path, instead of serving files ourselves")
+	expireCheckIntervalHours = flag.Int("expire-interval", 1, "delay between two expiration checks (hours)")
+	storageRoot              = flag.String("root", "/var/lib/improut", "root storage directory")
 )
 
 var (
@@ -77,15 +79,19 @@ var (
 	kLutimDeleteRegexp = regexp.MustCompile("/d/([a-f0-9]{16}\\.[a-z]{3,5})/([a-f0-9]{32})$")
 )
 
-func storagePathFromRequest(r *http.Request) string {
-	return storagePath(strings.TrimLeft(r.URL.Path, "/"))
-}
-
-func storagePath(name string) string {
+func storageName(name string) string {
 	if !kNameRegexp.MatchString(name) {
 		return ""
 	}
-	return filepath.Join(*storageRoot, name)
+	return name
+}
+
+func storageNameFromRequest(r *http.Request) string {
+	return storageName(strings.TrimLeft(r.URL.Path, "/"))
+}
+
+func storagePath(storageName string) string {
+	return filepath.Join(*storageRoot, storageName)
 }
 
 func storeFile(file io.ReadCloser, originalName string, opts *options) (storedFile, error) {
@@ -95,7 +101,7 @@ func storeFile(file io.ReadCloser, originalName string, opts *options) (storedFi
 		return storedFile{}, err
 	}
 
-	tempPath := filepath.Join(*storageRoot, ".tmp-"+hex.EncodeToString(randBytes))
+	tempPath := storagePath(".tmp-" + hex.EncodeToString(randBytes))
 	defer func() { os.Remove(tempPath) }()
 	if err := func() error {
 		dst, err := os.Create(tempPath)
@@ -172,10 +178,10 @@ func deleteFile(path string, userDeletionToken string) error {
 
 func parseLifetimeDays(request *http.Request) int {
 	lifetimeDays, err := strconv.Atoi(request.FormValue(kLutimLifetimeArg))
-	if err != nil || lifetimeDays < 1 {
+	if err != nil || lifetimeDays < 0 {
 		lifetimeDays = *defaultLifetimeDays
 	}
-	if *maxLifetimeDays > 0 && lifetimeDays > *maxLifetimeDays {
+	if *maxLifetimeDays > 0 && (lifetimeDays == 0 || lifetimeDays > *maxLifetimeDays) {
 		lifetimeDays = *maxLifetimeDays
 	}
 	return lifetimeDays
@@ -224,7 +230,11 @@ func lutimDelete(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 		return
 	}
-	name := match[1]
+	name := storageName(match[1])
+	if name == "" {
+		http.Error(writer, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
 	deletionToken := match[2]
 	deleteErr := deleteFile(storagePath(name), deletionToken)
 	reply, err := json.Marshal(lutimDeleteReply{
@@ -241,6 +251,10 @@ func lutimDelete(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	writer.WriteHeader(map[bool]int{
+		true:  http.StatusOK,
+		false: http.StatusBadRequest,
+	}[deleteErr == nil])
 	writer.Write(reply)
 }
 
@@ -268,55 +282,60 @@ func restUpload(writer http.ResponseWriter, request *http.Request) {
 }
 
 func restDelete(writer http.ResponseWriter, request *http.Request) {
-	path := storagePathFromRequest(request)
-	if path == "" {
+	name := storageNameFromRequest(request)
+	if name == "" {
 		http.NotFound(writer, request)
 		return
 	}
-	if err := deleteFile(path, request.Header.Get(kDeletionTokenHeader)); err != nil {
-		http.Error(writer, err.Error(), http.StatusBadRequest)
+	if err := deleteFile(storagePath(name), request.Header.Get(kDeletionTokenHeader)); err != nil {
+		http.NotFound(writer, request)
 		return
 	}
 	writer.WriteHeader(http.StatusNoContent)
 }
 
-func detectLutim(request *http.Request) bool {
-	return request.FormValue("format") != "" || request.FormValue(kLutimLifetimeArg) != ""
-}
-
 func dispatch(writer http.ResponseWriter, request *http.Request) {
 	switch request.Method {
 	case http.MethodGet:
-		if kLutimDeleteRegexp.MatchString(request.URL.Path) {
-			lutimDelete(writer, request)
-			return
-		}
-		path := storagePathFromRequest(request)
-		if path == "" {
+		if request.URL.Path == "/" {
 			writer.Write([]byte(fmt.Sprintf(`
 improut ⋅ dead simple image hosting
 
 Upload:
-  POST / (multipart/format-data)
-             file=<image data>
-    [ delete-days=<lifetime in integer days> ]
+  $ curl -v -F file=@image.png [ -F delete-day=<lifetime in days> ] /
+	Returns a 302 redirect to the image, with %s header for deletion.
 
-  Returns either:
-    * JSON if Lutim is detected, which includes the deletion token.
-    * Otherwise a 302 redirect to the image, with header %s.
+  or (Lutim compatibility):
+  $ curl -v -F file=@image.png -F format=json [ -F delete-day=<lifetime in days> ] /
+	Returns a JSON reply which includes the deletion token.
 
 Delete existing image:
-  DELETE /<image path> with header %s from above.
-  or 
-  GET /d/<image path>/<deletion token>
+	$ curl -v -X DELETE -H '%s: <token>' /<image path>
 
+  or (Lutim compatibility):
+	$ curl -v /d/<image path>/<token>
 
 This is open-source software under MIT license:
 %s
 `, kDeletionTokenHeader, kDeletionTokenHeader, kGitUrl)))
 			return
 		}
-		http.ServeFile(writer, request, path)
+		if kLutimDeleteRegexp.MatchString(request.URL.Path) {
+			lutimDelete(writer, request)
+			return
+		}
+		name := storageNameFromRequest(request)
+		if name == "" {
+			http.NotFound(writer, request)
+			return
+		}
+		if *xAccel == "" {
+			http.ServeFile(writer, request, storagePath(name))
+		} else {
+			redirect := *xAccel + "/" + name
+			writer.Header().Set("X-Accel-Redirect", redirect)
+			writer.WriteHeader(204)
+		}
 	case http.MethodPost:
 		if request.URL.Path != "/" {
 			http.NotFound(writer, request)
@@ -326,7 +345,7 @@ This is open-source software under MIT license:
 			http.Error(writer, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if detectLutim(request) {
+		if request.FormValue("format") == "json" {
 			lutimUpload(writer, request)
 		} else {
 			restUpload(writer, request)
@@ -384,7 +403,7 @@ func checkExpired() {
 			}
 			return nil
 		})
-		time.Sleep(24 * 60 * 1000 * time.Millisecond)
+		time.Sleep(time.Duration(*expireCheckIntervalHours) * 60 * 1000 * time.Millisecond)
 	}
 }
 
