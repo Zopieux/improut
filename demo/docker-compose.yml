@@ -1,0 +1,11 @@
+version: "3"
+
+services:
+  # nginx listens on 8080, improut on its default 8000.
+  nginx:
+    image: nginx:mainline-alpine
+    network_mode: host
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./htpasswd:/etc/nginx/htpasswd:ro
+      - ./filestore:/srv/filestore:ro
